@@ -3,17 +3,8 @@ import numpy as np
 
 
 class MultiheadAttention(tf.keras.layers.Layer):
-    """Multi-head self/cross attention.
-
-    Bug fixed: the original code computed the residual as
-    ``output + q[:, :, 0, :]``, which silently picked a single head-slice of
-    the *projected* query tensor instead of the original input.  The fix
-    captures ``inputs[0]`` before any projection.
-    """
-
     def __init__(self, d_model, num_heads, dropout_rate=0.1):
         super().__init__()
-        # FIX: Added this to prevent Keras warnings about destroyed mask info
         self.supports_masking = True
         
         assert d_model % num_heads == 0, "d_model must be divisible by num_heads"
@@ -30,12 +21,10 @@ class MultiheadAttention(tf.keras.layers.Layer):
         self.dropout = tf.keras.layers.Dropout(dropout_rate)
         self.layernorm = tf.keras.layers.LayerNormalization(epsilon=1e-6)
 
-    # ------------------------------------------------------------------
     def split_heads(self, x, batch_size):
         x = tf.reshape(x, (batch_size, -1, self.num_heads, self.depth))
         return tf.transpose(x, perm=[0, 2, 1, 3])
 
-    # ------------------------------------------------------------------
     def scaled_dot_product_attention(self, q, k, v, mask):
         matmul_qk = tf.matmul(q, k, transpose_b=True)
 
@@ -49,7 +38,6 @@ class MultiheadAttention(tf.keras.layers.Layer):
         output = tf.matmul(attention_weights, v)
         return output, attention_weights
 
-    # ------------------------------------------------------------------
     def call(self, inputs, mask=None, training=None):
         q_input, k_input, v_input = inputs   # keep original query for residual
         batch_size = tf.shape(q_input)[0]
@@ -73,7 +61,6 @@ class MultiheadAttention(tf.keras.layers.Layer):
         return output, attention_weights
 
 
-# ---------------------------------------------------------------------------
 class ExpertLayer(tf.keras.layers.Layer):
     """Single FFN expert used inside MixtureOfExperts."""
 
@@ -91,17 +78,7 @@ class ExpertLayer(tf.keras.layers.Layer):
         return self.layernorm(x + out)
 
 
-# ---------------------------------------------------------------------------
 class MixtureOfExperts(tf.keras.layers.Layer):
-    """Sparse Top-K Mixture-of-Experts FFN.
-
-    Bug fixed: the original code tried to scatter expert outputs back via
-    ``tf.pad(..., [[0, N - n], [0, 0]])`` which assumes selected tokens
-    sit at position 0 — giving silently wrong results for all other tokens.
-    The fix uses ``tf.tensor_scatter_nd_add`` to write each expert's output
-    to the correct positions.
-    """
-
     def __init__(self, d_model, d_ff, num_experts, k=2, dropout_rate=0.1):
         super().__init__()
         self.d_model = d_model
@@ -111,7 +88,6 @@ class MixtureOfExperts(tf.keras.layers.Layer):
         self.experts = [ExpertLayer(d_model, d_ff, dropout_rate) for _ in range(num_experts)]
         self.router = tf.keras.layers.Dense(num_experts, use_bias=False)
 
-    # ------------------------------------------------------------------
     def call(self, x, training=None):
         batch_size = tf.shape(x)[0]
         seq_len = tf.shape(x)[1]
@@ -133,11 +109,8 @@ class MixtureOfExperts(tf.keras.layers.Layer):
                 expert_gates * tf.cast(is_this_expert, tf.float32), axis=-1
             )                                                 # [B*S]
 
-            # FIX: Used reshape instead of squeeze, as it is safer for dynamic shapes
             token_indices = tf.reshape(tf.where(gate_i > 0), [-1])
 
-            # FIX: Removed the non-graph-friendly 'if size == 0' check entirely.
-            # Empty tensor inputs flow seamlessly through tf.gather and dense layers.
 
             selected_inputs = tf.gather(x_flat, token_indices)   # [sel, d_model]
             expert_out = expert(selected_inputs, training=training)
@@ -148,7 +121,6 @@ class MixtureOfExperts(tf.keras.layers.Layer):
             )                                                  # [sel, 1]
             weighted_out = expert_out * selected_gates         # [sel, d_model]
 
-            # FIX: scatter to the correct token positions
             final_output = tf.tensor_scatter_nd_add(
                 final_output,
                 tf.expand_dims(token_indices, axis=1),         # [[idx], ...]
@@ -158,7 +130,6 @@ class MixtureOfExperts(tf.keras.layers.Layer):
         return tf.reshape(final_output, [batch_size, seq_len, self.d_model])
 
 
-# ---------------------------------------------------------------------------
 def get_angles(pos, i, d_model):
     angle_rates = 1 / np.power(10000, (2 * (i // 2)) / np.float32(d_model))
     return pos * angle_rates
