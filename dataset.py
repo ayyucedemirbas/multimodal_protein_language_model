@@ -1,28 +1,3 @@
-"""
-dataset.py – Download and prepare the TAPE secondary structure dataset.
-
-Dataset
--------
-TAPE (Tasks Assessing Protein Embeddings) secondary structure benchmark
-  • Source  : https://github.com/songlab-cal/tape
-  • Download: ~150 MB tarball hosted on AWS S3 (public, no login required)
-  • Labels  : 3-class (H / E / C) *and* 8-class (DSSP) per-residue labels
-  • Splits  : train (~8 500 chains), valid (~2 100 chains), test sets
-              CB513 / TS115 / CASP12
-
-Usage
------
-    from dataset import load_tape_secondary_structure
-
-    train_ds, valid_ds, vocabs = load_tape_secondary_structure(
-        data_dir="./tape_data",
-        max_length=512,
-        batch_size=32,
-        num_classes=3,     # 3 or 8
-    )
-    # train_ds yields (seq_tokens, struct_tokens) batches ready for the model.
-"""
-
 import os
 import json
 import tarfile
@@ -41,10 +16,6 @@ from preprocessing import (
     preprocess_structure_data,
 )
 
-
-# ---------------------------------------------------------------------------
-# Constants
-# ---------------------------------------------------------------------------
 TAPE_SS_URL = (
     "https://s3.amazonaws.com/songlabdata/proteindata/"
     "data_raw_pytorch/secondary_structure.tar.gz"
@@ -58,10 +29,6 @@ SPLIT_FILES = {
     "casp12": "secondary_structure/secondary_structure_casp12.json",
 }
 
-
-# ---------------------------------------------------------------------------
-# Download helpers
-# ---------------------------------------------------------------------------
 def _download_tape(data_dir: str) -> None:
     """Download and extract the TAPE secondary-structure tarball if needed."""
     data_dir = Path(data_dir)
@@ -93,10 +60,6 @@ def _download_tape(data_dir: str) -> None:
     marker.touch()
     print("[dataset] Done.")
 
-
-# ---------------------------------------------------------------------------
-# JSON loader
-# ---------------------------------------------------------------------------
 def _load_split(data_dir: str, split: str):
     """Load a TAPE JSON split and return (sequences, ss3_labels, ss8_labels)."""
     path = Path(data_dir) / SPLIT_FILES[split]
@@ -127,15 +90,11 @@ def _load_split(data_dir: str, split: str):
 
 
 def _int_to_label(label_str: str, elements: list) -> str:
-    """Convert a string of digit characters to letter labels, if needed."""
     if label_str and label_str[0].isdigit():
         return "".join(elements[int(c)] for c in label_str)
     return label_str
 
 
-# ---------------------------------------------------------------------------
-# tf.data pipeline
-# ---------------------------------------------------------------------------
 def _make_tf_dataset(
     sequences,
     structures,
@@ -164,10 +123,6 @@ def _make_tf_dataset(
     ds = ds.batch(batch_size, drop_remainder=False).prefetch(tf.data.AUTOTUNE)
     return ds
 
-
-# ---------------------------------------------------------------------------
-# Public API
-# ---------------------------------------------------------------------------
 def load_tape_secondary_structure(
     data_dir: str = "./tape_data",
     max_length: int = 512,
@@ -216,12 +171,7 @@ def load_tape_secondary_structure(
     vocabs = {"aa": aa_vocab, "ss": ss_vocab}
     return datasets, vocabs
 
-
-# ---------------------------------------------------------------------------
-# Quick stats helper
-# ---------------------------------------------------------------------------
 def dataset_stats(data_dir: str = "./tape_data", split: str = "train"):
-    """Print basic statistics for one split (useful for sanity-checking)."""
     _download_tape(data_dir)
     seqs, ss3, _ = _load_split(data_dir, split)
     lengths = [len(s) for s in seqs]
@@ -239,9 +189,6 @@ def dataset_stats(data_dir: str = "./tape_data", split: str = "train"):
         print(f"  {k}: {label_counts[k]:,}  ({label_counts[k]/total*100:.1f}%)")
 
 
-# ---------------------------------------------------------------------------
-# CLI convenience
-# ---------------------------------------------------------------------------
 if __name__ == "__main__":
     import argparse
     parser = argparse.ArgumentParser()
