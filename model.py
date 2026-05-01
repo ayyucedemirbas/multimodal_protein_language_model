@@ -4,17 +4,6 @@ from decoder import ProteinDecoder
 
 
 class MultimodalProteinModel(tf.keras.Model):
-    """Sequence-to-structure protein model with optional image modality.
-
-    Changes vs. original
-    --------------------
-    * ``call()`` no longer hard-unpacks 3 inputs; image is passed explicitly
-      as a keyword arg so ``train_step`` does not need to wrap ``None``.
-    * Label-smoothing loss for better generalisation.
-    * ``train_step`` / ``test_step`` added so Keras handles both modes.
-    * FIX: Positional arguments in layer calls updated to keyword arguments.
-    """
-
     def __init__(
         self,
         num_encoder_layers,
@@ -36,13 +25,12 @@ class MultimodalProteinModel(tf.keras.Model):
             num_encoder_layers, d_model, num_heads, d_ff,
             num_experts, k, amino_acid_vocab_size, max_seq_length, dropout_rate,
         )
-        # FIX: max_seq_length + 2 to accommodate <START> and <END> tokens
+
         self.decoder = ProteinDecoder(
             num_decoder_layers, d_model, num_heads, d_ff,
             num_experts, k, structure_vocab_size, max_seq_length + 2, dropout_rate,
         )
 
-        # Image encoder (used only when structural images are provided)
         self.image_encoder = tf.keras.Sequential([
             tf.keras.layers.Conv2D(64,  (3, 3), activation="relu", padding="same"),
             tf.keras.layers.MaxPooling2D((2, 2)),
@@ -57,7 +45,6 @@ class MultimodalProteinModel(tf.keras.Model):
         self.fusion_layer = tf.keras.layers.Dense(d_model)
         self.final_layer  = tf.keras.layers.Dense(structure_vocab_size)
 
-        # Loss with label smoothing
         self.loss_fn = tf.keras.losses.CategoricalCrossentropy(
             from_logits=True,
             label_smoothing=label_smoothing,
@@ -71,11 +58,7 @@ class MultimodalProteinModel(tf.keras.Model):
 
         self.structure_vocab_size = structure_vocab_size
 
-    # ------------------------------------------------------------------
-    # Mask helpers
-    # ------------------------------------------------------------------
     def create_padding_mask(self, seq):
-        """Returns 1.0 for PAD tokens (id == 0), 0.0 elsewhere."""
         seq = tf.cast(tf.math.equal(seq, 0), tf.float32)
         return seq[:, tf.newaxis, tf.newaxis, :]
 
@@ -90,9 +73,6 @@ class MultimodalProteinModel(tf.keras.Model):
         combined_mask     = tf.maximum(dec_target_mask, look_ahead_mask)
         return enc_padding_mask, combined_mask, dec_padding_mask
 
-    # ------------------------------------------------------------------
-    # Forward pass
-    # ------------------------------------------------------------------
     def call(self, protein_seq, structure_targets, structural_image=None, training=None):
         enc_padding_mask, combined_mask, dec_padding_mask = self.create_masks(
             protein_seq, structure_targets
@@ -119,20 +99,14 @@ class MultimodalProteinModel(tf.keras.Model):
         final_output = self.final_layer(dec_output)
         return final_output, attention_weights
 
-    # ------------------------------------------------------------------
-    # Masked loss helper
-    # ------------------------------------------------------------------
+
     def _masked_loss(self, real, pred):
-        """Sparse CCE loss that ignores PAD (id == 0) positions."""
         real_oh = tf.one_hot(real, self.structure_vocab_size)  # for label-smoothing loss
         per_token_loss = self.loss_fn(real_oh, pred)            # (B, T)
         mask = tf.cast(tf.not_equal(real, 0), tf.float32)
         loss = tf.reduce_sum(per_token_loss * mask) / (tf.reduce_sum(mask) + 1e-8)
         return loss
 
-    # ------------------------------------------------------------------
-    # train_step
-    # ------------------------------------------------------------------
     def train_step(self, data):
         if len(data) == 3:
             protein_seq, structure_targets, structural_image = data
@@ -144,7 +118,6 @@ class MultimodalProteinModel(tf.keras.Model):
         real_output = structure_targets[:, 1:]
 
         with tf.GradientTape() as tape:
-            # FIX: Passed secondary inputs as explicit kwargs to avoid positional validation
             predictions, _ = self(
                 protein_seq, 
                 structure_targets=dec_input, 
@@ -161,9 +134,6 @@ class MultimodalProteinModel(tf.keras.Model):
         self.accuracy_metric.update_state(real_output, predictions)
         return {"loss": self.loss_tracker.result(), "accuracy": self.accuracy_metric.result()}
 
-    # ------------------------------------------------------------------
-    # test_step (validation / evaluation)
-    # ------------------------------------------------------------------
     def test_step(self, data):
         if len(data) == 3:
             protein_seq, structure_targets, structural_image = data
@@ -174,7 +144,6 @@ class MultimodalProteinModel(tf.keras.Model):
         dec_input   = structure_targets[:, :-1]
         real_output = structure_targets[:, 1:]
 
-        # FIX: Passed secondary inputs as explicit kwargs
         predictions, _ = self(
             protein_seq, 
             structure_targets=dec_input, 
@@ -198,7 +167,6 @@ class MultimodalProteinModel(tf.keras.Model):
         ]
 
 
-# ---------------------------------------------------------------------------
 class CustomLearningRateScheduler(tf.keras.optimizers.schedules.LearningRateSchedule):
     """Transformer warm-up schedule: lr ∝ d_model^-0.5 · min(step^-0.5, step·warmup^-1.5)."""
 
