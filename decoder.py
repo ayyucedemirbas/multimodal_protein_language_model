@@ -56,8 +56,7 @@ class ProteinDecoder(tf.keras.layers.Layer):
         dropout_rate=0.1,
     ):
         super().__init__()
-        self.supports_masking = True  # FIX: Tell Keras to preserve masks
-
+        self.supports_masking = True
         self.d_model = d_model
         self.num_layers = num_layers
 
