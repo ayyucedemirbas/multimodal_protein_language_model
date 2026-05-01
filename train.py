@@ -1,7 +1,6 @@
 import tensorflow as tf
 import importlib
 
-# 1. Force Python to reload the modules from disk, ignoring the RAM cache
 import layers
 import encoder
 import decoder
@@ -14,12 +13,10 @@ importlib.reload(decoder)
 importlib.reload(model)
 importlib.reload(dataset)
 
-# Now import the fresh classes
 from dataset import load_tape_secondary_structure
 from model import MultimodalProteinModel, CustomLearningRateScheduler
 
 def main():
-    print("Loading datasets...")
     datasets, vocabs = load_tape_secondary_structure(
         data_dir="./tape_data",
         max_length=512,
@@ -64,7 +61,6 @@ def main():
         verbose=1
     )
     
-    print("Starting training...")
     history = protein_model.fit(
         train_ds,
         validation_data=valid_ds,
