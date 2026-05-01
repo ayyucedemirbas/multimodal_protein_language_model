@@ -1,168 +1,175 @@
 import tensorflow as tf
 import numpy as np
 
+
 class MultiheadAttention(tf.keras.layers.Layer):
+    """Multi-head self/cross attention.
+
+    Bug fixed: the original code computed the residual as
+    ``output + q[:, :, 0, :]``, which silently picked a single head-slice of
+    the *projected* query tensor instead of the original input.  The fix
+    captures ``inputs[0]`` before any projection.
+    """
+
     def __init__(self, d_model, num_heads, dropout_rate=0.1):
-        super(MultiheadAttention, self).__init__()
+        super().__init__()
+        # FIX: Added this to prevent Keras warnings about destroyed mask info
+        self.supports_masking = True
+        
+        assert d_model % num_heads == 0, "d_model must be divisible by num_heads"
+
         self.num_heads = num_heads
         self.d_model = d_model
-        
-        assert d_model % self.num_heads == 0
-        
-        self.depth = d_model // self.num_heads
-        
+        self.depth = d_model // num_heads
+
         self.wq = tf.keras.layers.Dense(d_model)
         self.wk = tf.keras.layers.Dense(d_model)
         self.wv = tf.keras.layers.Dense(d_model)
-        
         self.dense = tf.keras.layers.Dense(d_model)
+
         self.dropout = tf.keras.layers.Dropout(dropout_rate)
         self.layernorm = tf.keras.layers.LayerNormalization(epsilon=1e-6)
-    
+
+    # ------------------------------------------------------------------
     def split_heads(self, x, batch_size):
         x = tf.reshape(x, (batch_size, -1, self.num_heads, self.depth))
         return tf.transpose(x, perm=[0, 2, 1, 3])
-    
-    def call(self, inputs, mask=None, training=None):
-        q, k, v = inputs
-        batch_size = tf.shape(q)[0]
-        
-        q = self.wq(q)  # (batch_size, seq_len, d_model)
-        k = self.wk(k)  # (batch_size, seq_len, d_model)
-        v = self.wv(v)  # (batch_size, seq_len, d_model)
-        
-        q = self.split_heads(q, batch_size)  # (batch_size, num_heads, seq_len_q, depth)
-        k = self.split_heads(k, batch_size)  # (batch_size, num_heads, seq_len_k, depth)
-        v = self.split_heads(v, batch_size)  # (batch_size, num_heads, seq_len_v, depth)
-        
-        # scaled_attention.shape == (batch_size, num_heads, seq_len_q, depth)
-        # attention_weights.shape == (batch_size, num_heads, seq_len_q, seq_len_k)
-        scaled_attention, attention_weights = self.scaled_dot_product_attention(
-            q, k, v, mask)
-        
-        scaled_attention = tf.transpose(scaled_attention, perm=[0, 2, 1, 3])  # (batch_size, seq_len_q, num_heads, depth)
-        
-        concat_attention = tf.reshape(scaled_attention, 
-                                      (batch_size, -1, self.d_model))  # (batch_size, seq_len_q, d_model)
-        
-        output = self.dense(concat_attention)  # (batch_size, seq_len_q, d_model)
-        output = self.dropout(output, training=training)
-        output = self.layernorm(output + q[:, :, 0, :])
-        
-        return output, attention_weights
-    
+
+    # ------------------------------------------------------------------
     def scaled_dot_product_attention(self, q, k, v, mask):
-        matmul_qk = tf.matmul(q, k, transpose_b=True)  # (..., seq_len_q, seq_len_k)
-        
-        # scale matmul_qk
+        matmul_qk = tf.matmul(q, k, transpose_b=True)
+
         dk = tf.cast(tf.shape(k)[-1], tf.float32)
-        scaled_attention_logits = matmul_qk / tf.math.sqrt(dk)
-        
-        # add the mask to the scaled tensor.
+        scaled = matmul_qk / tf.math.sqrt(dk)
+
         if mask is not None:
-            scaled_attention_logits += (mask * -1e9)  
-        
-        # softmax is normalized on the last axis (seq_len_k) so that the scores
-        # add up to 1.
-        attention_weights = tf.nn.softmax(scaled_attention_logits, axis=-1)  # (..., seq_len_q, seq_len_k)
-        
-        output = tf.matmul(attention_weights, v)  # (..., seq_len_q, depth_v)
-        
+            scaled += mask * -1e9
+
+        attention_weights = tf.nn.softmax(scaled, axis=-1)
+        output = tf.matmul(attention_weights, v)
         return output, attention_weights
 
+    # ------------------------------------------------------------------
+    def call(self, inputs, mask=None, training=None):
+        q_input, k_input, v_input = inputs   # keep original query for residual
+        batch_size = tf.shape(q_input)[0]
+
+        q = self.split_heads(self.wq(q_input), batch_size)
+        k = self.split_heads(self.wk(k_input), batch_size)
+        v = self.split_heads(self.wv(v_input), batch_size)
+
+        scaled_attention, attention_weights = self.scaled_dot_product_attention(q, k, v, mask)
+
+        # Merge heads back
+        scaled_attention = tf.transpose(scaled_attention, perm=[0, 2, 1, 3])
+        concat = tf.reshape(scaled_attention, (batch_size, -1, self.d_model))
+
+        output = self.dense(concat)
+        output = self.dropout(output, training=training)
+
+        # FIX: residual uses the *original* query input, not a head-slice
+        output = self.layernorm(output + q_input)
+
+        return output, attention_weights
+
+
+# ---------------------------------------------------------------------------
 class ExpertLayer(tf.keras.layers.Layer):
+    """Single FFN expert used inside MixtureOfExperts."""
+
     def __init__(self, d_model, d_ff, dropout_rate=0.1):
-        super(ExpertLayer, self).__init__()
-        self.d_model = d_model
-        self.d_ff = d_ff
-        
-        self.dense1 = tf.keras.layers.Dense(d_ff, activation='relu')
+        super().__init__()
+        self.dense1 = tf.keras.layers.Dense(d_ff, activation="gelu")
         self.dense2 = tf.keras.layers.Dense(d_model)
         self.dropout = tf.keras.layers.Dropout(dropout_rate)
         self.layernorm = tf.keras.layers.LayerNormalization(epsilon=1e-6)
-    
+
     def call(self, x, training=None):
         out = self.dense1(x)
         out = self.dense2(out)
         out = self.dropout(out, training=training)
         return self.layernorm(x + out)
 
+
+# ---------------------------------------------------------------------------
 class MixtureOfExperts(tf.keras.layers.Layer):
+    """Sparse Top-K Mixture-of-Experts FFN.
+
+    Bug fixed: the original code tried to scatter expert outputs back via
+    ``tf.pad(..., [[0, N - n], [0, 0]])`` which assumes selected tokens
+    sit at position 0 — giving silently wrong results for all other tokens.
+    The fix uses ``tf.tensor_scatter_nd_add`` to write each expert's output
+    to the correct positions.
+    """
+
     def __init__(self, d_model, d_ff, num_experts, k=2, dropout_rate=0.1):
-        super(MixtureOfExperts, self).__init__()
+        super().__init__()
         self.d_model = d_model
         self.num_experts = num_experts
-        self.k = k  # Top-k gating: select k experts per token
-        
-        self.experts = [ExpertLayer(d_model, d_ff, dropout_rate) for _ in range(num_experts)]
-        
-        # Router (gate) to select experts
-        self.router = tf.keras.layers.Dense(num_experts, use_bias=False)
-        
-    def call(self, x, training=None):
-        batch_size, seq_len, d_model = tf.shape(x)[0], tf.shape(x)[1], self.d_model
-        x_flat = tf.reshape(x, [-1, d_model])  # [batch_size * seq_len, d_model]
-        
-        # Get router logits and probabilities
-        router_logits = self.router(x_flat)  # [batch_size * seq_len, num_experts]
-        
-        # Get top-k experts per token
-        expert_gate, expert_index = tf.math.top_k(router_logits, k=self.k)
-        
-        # Normalize the gate values within the top-k
-        expert_gate = tf.nn.softmax(expert_gate, axis=-1)
-        
-        # One-hot encode the expert indices
-        expert_mask = tf.one_hot(expert_index, depth=self.num_experts)  # [batch_size * seq_len, k, num_experts]
-        
-        # Expand and reshape inputs for parallel expert computation
-        x_expanded = tf.expand_dims(x_flat, axis=1)  # [batch_size * seq_len, 1, d_model]
-        x_expanded = tf.tile(x_expanded, [1, self.k, 1])  # [batch_size * seq_len, k, d_model]
-        
-        # Initialize final output
-        final_output = tf.zeros_like(x_flat)
-        
-        # Process each expert 
-        for i, expert in enumerate(self.experts):
-            # Extract which positions need to be processed by this expert
-            expert_mask_i = expert_mask[:, :, i]  # [batch_size * seq_len, k]
-            expert_gate_i = expert_gate * expert_mask_i  # [batch_size * seq_len, k]
-            
-            # Expert selection: when expert_mask_i is 1, process with current expert
-            # Otherwise, use zeros
-            positions = tf.where(tf.reduce_sum(expert_mask_i, axis=1) > 0)
-            if tf.shape(positions)[0] > 0:
-                selected_inputs = tf.gather(x_flat, positions[:, 0])
-                expert_outputs = expert(selected_inputs, training=training)
-                
-                # Compute weighted expert outputs by gates and add to final output
-                for j in range(self.k):
-                    gate_values = tf.expand_dims(expert_gate_i[:, j], axis=1)
-                    weighted_output = gate_values * tf.pad(
-                        expert_outputs,
-                        [[0, tf.shape(x_flat)[0] - tf.shape(expert_outputs)[0]], [0, 0]],
-                        mode='CONSTANT')
-                    final_output += weighted_output
-                    
-        # Reshape back to original dimensions
-        return tf.reshape(final_output, [batch_size, seq_len, d_model])
+        self.k = k
 
-# Positional Encoding
+        self.experts = [ExpertLayer(d_model, d_ff, dropout_rate) for _ in range(num_experts)]
+        self.router = tf.keras.layers.Dense(num_experts, use_bias=False)
+
+    # ------------------------------------------------------------------
+    def call(self, x, training=None):
+        batch_size = tf.shape(x)[0]
+        seq_len = tf.shape(x)[1]
+
+        x_flat = tf.reshape(x, [-1, self.d_model])          # [B*S, d_model]
+
+        router_logits = self.router(x_flat)                  # [B*S, num_experts]
+        expert_gates, expert_indices = tf.math.top_k(router_logits, k=self.k)
+        expert_gates = tf.nn.softmax(expert_gates, axis=-1)  # [B*S, k]
+
+        final_output = tf.zeros_like(x_flat)                 # [B*S, d_model]
+
+        for i, expert in enumerate(self.experts):
+            # Boolean mask: which (token, slot) pairs route to expert i
+            is_this_expert = tf.equal(expert_indices, i)     # [B*S, k]
+
+            # Aggregate gate weight from all k slots for this expert
+            gate_i = tf.reduce_sum(
+                expert_gates * tf.cast(is_this_expert, tf.float32), axis=-1
+            )                                                 # [B*S]
+
+            # FIX: Used reshape instead of squeeze, as it is safer for dynamic shapes
+            token_indices = tf.reshape(tf.where(gate_i > 0), [-1])
+
+            # FIX: Removed the non-graph-friendly 'if size == 0' check entirely.
+            # Empty tensor inputs flow seamlessly through tf.gather and dense layers.
+
+            selected_inputs = tf.gather(x_flat, token_indices)   # [sel, d_model]
+            expert_out = expert(selected_inputs, training=training)
+
+            # Scale by gate values
+            selected_gates = tf.expand_dims(
+                tf.gather(gate_i, token_indices), axis=-1
+            )                                                  # [sel, 1]
+            weighted_out = expert_out * selected_gates         # [sel, d_model]
+
+            # FIX: scatter to the correct token positions
+            final_output = tf.tensor_scatter_nd_add(
+                final_output,
+                tf.expand_dims(token_indices, axis=1),         # [[idx], ...]
+                weighted_out,
+            )
+
+        return tf.reshape(final_output, [batch_size, seq_len, self.d_model])
+
+
+# ---------------------------------------------------------------------------
 def get_angles(pos, i, d_model):
-    angle_rates = 1 / np.power(10000, (2 * (i//2)) / np.float32(d_model))
+    angle_rates = 1 / np.power(10000, (2 * (i // 2)) / np.float32(d_model))
     return pos * angle_rates
 
+
 def positional_encoding(position, d_model):
-    angle_rads = get_angles(np.arange(position)[:, np.newaxis],
-                            np.arange(d_model)[np.newaxis, :],
-                            d_model)
-    
-    # apply sin to even indices in the array; 2i
+    angle_rads = get_angles(
+        np.arange(position)[:, np.newaxis],
+        np.arange(d_model)[np.newaxis, :],
+        d_model,
+    )
     angle_rads[:, 0::2] = np.sin(angle_rads[:, 0::2])
-    
-    # apply cos to odd indices in the array; 2i+1
     angle_rads[:, 1::2] = np.cos(angle_rads[:, 1::2])
-    
-    pos_encoding = angle_rads[np.newaxis, ...]
-    
-    return tf.cast(pos_encoding, dtype=tf.float32)
+    return tf.cast(angle_rads[np.newaxis, ...], dtype=tf.float32)

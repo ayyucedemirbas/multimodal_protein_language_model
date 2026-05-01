@@ -2,149 +2,216 @@ import tensorflow as tf
 from encoder import ProteinEncoder
 from decoder import ProteinDecoder
 
+
 class MultimodalProteinModel(tf.keras.Model):
-    def __init__(self, num_encoder_layers, num_decoder_layers, d_model, num_heads, d_ff,
-                 num_experts, k, amino_acid_vocab_size, structure_vocab_size, 
-                 max_seq_length, dropout_rate=0.1):
-        super(MultimodalProteinModel, self).__init__()
-        
-        # Main Encoder-Decoder for Protein Sequence to Structure/Function
-        self.encoder = ProteinEncoder(num_encoder_layers, d_model, num_heads, d_ff,
-                                     num_experts, k, amino_acid_vocab_size,
-                                     max_seq_length, dropout_rate)
-        
-        self.decoder = ProteinDecoder(num_decoder_layers, d_model, num_heads, d_ff,
-                                     num_experts, k, structure_vocab_size,
-                                     max_seq_length, dropout_rate)
-        
-        # Image Encoder for multimodal processing (handling structural data)
+    """Sequence-to-structure protein model with optional image modality.
+
+    Changes vs. original
+    --------------------
+    * ``call()`` no longer hard-unpacks 3 inputs; image is passed explicitly
+      as a keyword arg so ``train_step`` does not need to wrap ``None``.
+    * Label-smoothing loss for better generalisation.
+    * ``train_step`` / ``test_step`` added so Keras handles both modes.
+    * FIX: Positional arguments in layer calls updated to keyword arguments.
+    """
+
+    def __init__(
+        self,
+        num_encoder_layers,
+        num_decoder_layers,
+        d_model,
+        num_heads,
+        d_ff,
+        num_experts,
+        k,
+        amino_acid_vocab_size,
+        structure_vocab_size,
+        max_seq_length,
+        dropout_rate=0.1,
+        label_smoothing=0.1,
+    ):
+        super().__init__()
+
+        self.encoder = ProteinEncoder(
+            num_encoder_layers, d_model, num_heads, d_ff,
+            num_experts, k, amino_acid_vocab_size, max_seq_length, dropout_rate,
+        )
+        # FIX: max_seq_length + 2 to accommodate <START> and <END> tokens
+        self.decoder = ProteinDecoder(
+            num_decoder_layers, d_model, num_heads, d_ff,
+            num_experts, k, structure_vocab_size, max_seq_length + 2, dropout_rate,
+        )
+
+        # Image encoder (used only when structural images are provided)
         self.image_encoder = tf.keras.Sequential([
-            tf.keras.layers.Conv2D(64, (3, 3), activation='relu', padding='same'),
+            tf.keras.layers.Conv2D(64,  (3, 3), activation="relu", padding="same"),
             tf.keras.layers.MaxPooling2D((2, 2)),
-            tf.keras.layers.Conv2D(128, (3, 3), activation='relu', padding='same'),
+            tf.keras.layers.Conv2D(128, (3, 3), activation="relu", padding="same"),
             tf.keras.layers.MaxPooling2D((2, 2)),
-            tf.keras.layers.Conv2D(256, (3, 3), activation='relu', padding='same'),
+            tf.keras.layers.Conv2D(256, (3, 3), activation="relu", padding="same"),
             tf.keras.layers.MaxPooling2D((2, 2)),
             tf.keras.layers.Flatten(),
-            tf.keras.layers.Dense(d_model)
+            tf.keras.layers.Dense(d_model),
         ])
-        
-        # Cross-modal fusion module
+
         self.fusion_layer = tf.keras.layers.Dense(d_model)
-        
-        # Final prediction layers
-        self.final_layer = tf.keras.layers.Dense(structure_vocab_size)
-        
-        # Loss tracker
-        self.loss_tracker = tf.keras.metrics.Mean(name="loss")
-        self.accuracy_metric = tf.keras.metrics.SparseCategoricalAccuracy(name="accuracy")
-        
+        self.final_layer  = tf.keras.layers.Dense(structure_vocab_size)
+
+        # Loss with label smoothing
+        self.loss_fn = tf.keras.losses.CategoricalCrossentropy(
+            from_logits=True,
+            label_smoothing=label_smoothing,
+            reduction="none",
+        )
+
+        self.loss_tracker     = tf.keras.metrics.Mean(name="loss")
+        self.accuracy_metric  = tf.keras.metrics.SparseCategoricalAccuracy(name="accuracy")
+        self.val_loss_tracker = tf.keras.metrics.Mean(name="val_loss")
+        self.val_acc_tracker  = tf.keras.metrics.SparseCategoricalAccuracy(name="val_accuracy")
+
+        self.structure_vocab_size = structure_vocab_size
+
+    # ------------------------------------------------------------------
+    # Mask helpers
+    # ------------------------------------------------------------------
     def create_padding_mask(self, seq):
+        """Returns 1.0 for PAD tokens (id == 0), 0.0 elsewhere."""
         seq = tf.cast(tf.math.equal(seq, 0), tf.float32)
-        
-        # add extra dimensions to add the padding to the attention logits.
-        return seq[:, tf.newaxis, tf.newaxis, :]  # (batch_size, 1, 1, seq_len)
-    
+        return seq[:, tf.newaxis, tf.newaxis, :]
+
     def create_look_ahead_mask(self, size):
-        mask = 1 - tf.linalg.band_part(tf.ones((size, size)), -1, 0)
-        return mask  # (seq_len, seq_len)
-    
+        return 1 - tf.linalg.band_part(tf.ones((size, size)), -1, 0)
+
     def create_masks(self, inp, tar):
-        # Encoder padding mask
-        enc_padding_mask = self.create_padding_mask(inp)
-        
-        # Used in the 2nd attention block in the decoder.
-        # This padding mask is used to mask the encoder outputs.
-        dec_padding_mask = self.create_padding_mask(inp)
-        
-        # Used in the 1st attention block in the decoder.
-        # It is used to pad and mask future tokens in the input received by 
-        # the decoder.
-        look_ahead_mask = self.create_look_ahead_mask(tf.shape(tar)[1])
-        dec_target_padding_mask = self.create_padding_mask(tar)
-        combined_mask = tf.maximum(dec_target_padding_mask, look_ahead_mask)
-        
+        enc_padding_mask  = self.create_padding_mask(inp)
+        dec_padding_mask  = self.create_padding_mask(inp)
+        look_ahead_mask   = self.create_look_ahead_mask(tf.shape(tar)[1])
+        dec_target_mask   = self.create_padding_mask(tar)
+        combined_mask     = tf.maximum(dec_target_mask, look_ahead_mask)
         return enc_padding_mask, combined_mask, dec_padding_mask
-    
-    def call(self, inputs, training=None):
-        # Unpack inputs
-        protein_seq, structure_targets, structural_image = inputs
-        
-        # Create masks for the transformer
-        enc_padding_mask, look_ahead_mask, dec_padding_mask = self.create_masks(
-            protein_seq, structure_targets)
-        
-        # Process sequence through encoder
-        enc_output = self.encoder(protein_seq, training, enc_padding_mask)
-        
-        # Process structural image if available
+
+    # ------------------------------------------------------------------
+    # Forward pass
+    # ------------------------------------------------------------------
+    def call(self, protein_seq, structure_targets, structural_image=None, training=None):
+        enc_padding_mask, combined_mask, dec_padding_mask = self.create_masks(
+            protein_seq, structure_targets
+        )
+
+        enc_output = self.encoder(protein_seq, training=training, mask=enc_padding_mask)
+
         if structural_image is not None:
             image_features = self.image_encoder(structural_image, training=training)
             image_features = tf.expand_dims(image_features, axis=1)
-            
-            # Repeat image features to match sequence length
-            seq_len = tf.shape(enc_output)[1]
+            seq_len        = tf.shape(enc_output)[1]
             image_features = tf.repeat(image_features, seq_len, axis=1)
-            
-            # Fusion of sequence and image features
-            enc_output = self.fusion_layer(tf.concat([enc_output, image_features], axis=-1))
-        
-        # Process through decoder
+            enc_output     = self.fusion_layer(
+                tf.concat([enc_output, image_features], axis=-1)
+            )
+
         dec_output, attention_weights = self.decoder(
-            structure_targets, enc_output, training, look_ahead_mask, dec_padding_mask)
-        
-        # Final prediction layer
+            structure_targets, 
+            enc_output, 
+            training=training, 
+            look_ahead_mask=combined_mask, 
+            padding_mask=dec_padding_mask
+        )
         final_output = self.final_layer(dec_output)
-        
         return final_output, attention_weights
-    
+
+    # ------------------------------------------------------------------
+    # Masked loss helper
+    # ------------------------------------------------------------------
+    def _masked_loss(self, real, pred):
+        """Sparse CCE loss that ignores PAD (id == 0) positions."""
+        real_oh = tf.one_hot(real, self.structure_vocab_size)  # for label-smoothing loss
+        per_token_loss = self.loss_fn(real_oh, pred)            # (B, T)
+        mask = tf.cast(tf.not_equal(real, 0), tf.float32)
+        loss = tf.reduce_sum(per_token_loss * mask) / (tf.reduce_sum(mask) + 1e-8)
+        return loss
+
+    # ------------------------------------------------------------------
+    # train_step
+    # ------------------------------------------------------------------
     def train_step(self, data):
-        # Unpack the data
         if len(data) == 3:
             protein_seq, structure_targets, structural_image = data
         else:
             protein_seq, structure_targets = data
             structural_image = None
-        
-        # Shift targets for teacher forcing (decoder input and real output)
-        decoder_input = structure_targets[:, :-1]
+
+        dec_input  = structure_targets[:, :-1]
         real_output = structure_targets[:, 1:]
-        
+
         with tf.GradientTape() as tape:
-            # Forward pass
-            if structural_image is not None:
-                predictions, _ = self((protein_seq, decoder_input, structural_image), training=True)
-            else:
-                predictions, _ = self((protein_seq, decoder_input, None), training=True)
-            
-            # Calculate loss
-            loss = self.compiled_loss(real_output, predictions)
-        
-        # Calculate gradients and apply via optimizer
-        gradients = tape.gradient(loss, self.trainable_variables)
-        self.optimizer.apply_gradients(zip(gradients, self.trainable_variables))
-        
-        # Update metrics
+            # FIX: Passed secondary inputs as explicit kwargs to avoid positional validation
+            predictions, _ = self(
+                protein_seq, 
+                structure_targets=dec_input, 
+                structural_image=structural_image, 
+                training=True
+            )
+            loss = self._masked_loss(real_output, predictions)
+
+        grads = tape.gradient(loss, self.trainable_variables)
+        grads, _ = tf.clip_by_global_norm(grads, clip_norm=1.0)
+        self.optimizer.apply_gradients(zip(grads, self.trainable_variables))
+
         self.loss_tracker.update_state(loss)
         self.accuracy_metric.update_state(real_output, predictions)
-        
         return {"loss": self.loss_tracker.result(), "accuracy": self.accuracy_metric.result()}
-    
+
+    # ------------------------------------------------------------------
+    # test_step (validation / evaluation)
+    # ------------------------------------------------------------------
+    def test_step(self, data):
+        if len(data) == 3:
+            protein_seq, structure_targets, structural_image = data
+        else:
+            protein_seq, structure_targets = data
+            structural_image = None
+
+        dec_input   = structure_targets[:, :-1]
+        real_output = structure_targets[:, 1:]
+
+        # FIX: Passed secondary inputs as explicit kwargs
+        predictions, _ = self(
+            protein_seq, 
+            structure_targets=dec_input, 
+            structural_image=structural_image, 
+            training=False
+        )
+        loss = self._masked_loss(real_output, predictions)
+
+        self.val_loss_tracker.update_state(loss)
+        self.val_acc_tracker.update_state(real_output, predictions)
+        return {
+            "val_loss": self.val_loss_tracker.result(),
+            "val_accuracy": self.val_acc_tracker.result(),
+        }
+
     @property
     def metrics(self):
-        return [self.loss_tracker, self.accuracy_metric]
+        return [
+            self.loss_tracker, self.accuracy_metric,
+            self.val_loss_tracker, self.val_acc_tracker,
+        ]
 
-# Custom learning rate scheduler with warmup
+
+# ---------------------------------------------------------------------------
 class CustomLearningRateScheduler(tf.keras.optimizers.schedules.LearningRateSchedule):
+    """Transformer warm-up schedule: lr ∝ d_model^-0.5 · min(step^-0.5, step·warmup^-1.5)."""
+
     def __init__(self, d_model, warmup_steps=4000):
-        super(CustomLearningRateScheduler, self).__init__()
-        
+        super().__init__()
         self.d_model = tf.cast(d_model, tf.float32)
         self.warmup_steps = warmup_steps
-    
+
     def __call__(self, step):
-        step = tf.cast(step, tf.float32)
-        arg1 = tf.math.rsqrt(step)
-        arg2 = step * (self.warmup_steps ** -1.5)
-        
+        step  = tf.cast(step, tf.float32)
+        arg1  = tf.math.rsqrt(step)
+        arg2  = step * (self.warmup_steps ** -1.5)
         return tf.math.rsqrt(self.d_model) * tf.math.minimum(arg1, arg2)
+
+    def get_config(self):
+        return {"d_model": int(self.d_model.numpy()), "warmup_steps": self.warmup_steps}
